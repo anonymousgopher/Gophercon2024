@@ -25,9 +25,9 @@ In more detail, by leveraging Go concepts including interfaces, channels, ticker
 3. Incrementally increases processing rate after component has returned to a stable state
 4. Surfaces configuration options in a minimal, backwards-compatible manner that minimizes developer overhead
 
-Over time, with the pressure relief valve in action, our system throughput will look like this:
+The image below demonstrates the effect of the pressure relief valve on a given metric (ex. CPU) over time, automatically containing its oscillation in proximity of a soft limit, resulting in maximum throughput without reaching the metric limit.
 
-<img width="804" alt="Throughput over time" src="https://github.com/anonymousgopher/Gophercon2024/assets/161173606/e95adbd7-5b7f-4f62-a1a5-9b39272a230b">
+<img width="804" alt="Throughput over time" src="https://github.com/anonymousgopher/Gophercon2024/assets/161173606/32533589-73e9-4ef3-aedb-ef68a6bea4e3">
 
 Today we will walk through a simplified version of this pressure relief valve that has been deployed in our backend ecosystem at [company]. This talk showcases some powerful features within the Go programming language and illustrates how they can be used together to solve a non-trivial problem. The goal is to inspire the audience to incorporate some of these concepts into their own solutions. In the interest of time, all code snippets will be written ahead of time and a live code walkthrough and demo will be done.
 
@@ -37,16 +37,16 @@ Before we dive into the details, let's set the scene and go over some concepts a
 
 <img width="804" alt="Setup" src="https://github.com/anonymousgopher/Gophercon2024/assets/161173606/f60a49c4-1b7f-488a-8617-a87e50218960">
 
-This is a zoomed in and simplified representation of the event-based workflow used at [company]. In this diagram, both sender and recipient are individual microservices that make up the backend platform. The sender publishes messages with a topic, routing key, and message body. Messages are stored on different queues based on their binding (topic/key pair), and delivered to the respective consumer function FIFO (first in, first out) through a Go channel. On service startup, the recipient registers its own handlerFunc with each consumer, and when the consumer is ready to deliver the message to the recipient, it invokes the handlerFunc.
+The illustration above depicts a portion of the event-driven architecture and the components involved, which communicate primarily asynchronously using a message queue. The sender publishes messages with a topic, routing key, and message body. Messages are stored on different queues based on their binding (topic/key pair), and delivered to the respective consumer function FIFO (first in, first out) through a Go channel. On service startup, the recipient registers its own handlerFunc with each consumer, and when the consumer is ready to deliver the message to the recipient, it invokes the handlerFunc.
 
 
 # Alerting on Critical Components
 
-The first step in this process is to accurately detect when a critical dependency is overwhelmed. We addressed this by having a centralized service that monitored component metrics such as CPU and memory usage, and published a message on a dedicated “alerts” topic. When an alert is received, a flag on the broker is toggled to indicate if messages should be throttled or not. 
+The first step in this process is to accurately detect when a critical component is overwhelmed. At [company], we addressed this by having a centralized service that monitored component metrics such as CPU and memory usage, and published a message on a dedicated “alerts” topic. In subsequent sections of this proposal, we will explore how we can responsively address these alerts by building an automated mechanism to alleviate pressure on components until the alert is resolved. Overall, this is the behavior we are striving for:
 
-Here’s what the system response would look like when non-critical processes are throttled when an alert is triggered:
+<img width="804" alt="Throttling on Alerts" src="https://github.com/anonymousgopher/Gophercon2024/assets/161173606/4387fc00-b92a-4693-88a8-4f00c8165ef7">
 
-<img width="804" alt="Throttling on alerts" src="https://github.com/anonymousgopher/Gophercon2024/assets/161173606/64e6305c-9fa3-4f34-9f33-1541270b5519">
+In this illustration, we have three separate processes that are consuming varying amounts of CPU over time. Process A is considered a critical process that would cause noticeable issues to the end user if interrupted. process B and C are non-critical processes that would not cause functional problems, but should still be processed in a timely manner. When CPU usage hits the soft limit, an alert is triggered and each process is adjusted to alleviate pressure on our CPU. Specifically, process A is allowed to proceed normally, process B may proceed at a slower rate, and process C is temporarily halted. Once CPU usage returns to a healthy state, the alert is resolved and process B and C slowly return to their normal processing rate.
 
 # Pressure Relief via Throttling
 The primary mechanism we'll use today to relieve pressure on the system is throttling. We'll start by implementing a barebone throttler that gets the job done, and by the end of this section we'll have a solution that:
@@ -59,7 +59,7 @@ Let’s start by working on the basic barebone throttler.
 
 ## Barebone Throttler
 
-In this implementation, the main goal is to set up a separate process that receives messages from the main message queue and processes them at a slower rate. This preliminary step becomes the foundation to our throttler! 
+In this implementation, the main goal is to set up a separate process that receives non-time-sensitive messages from the main message queue and processes them at a slower rate. This preliminary step becomes the foundation to our throttler! 
 
 Visually, this is what we would like to achieve:
 
@@ -67,17 +67,18 @@ Visually, this is what we would like to achieve:
 
 For each binding (topic/key pair) to be throttled, we need a dedicated queue to store the throttled messages. Since every binding could have a different throttling configuration, there must be a separate queue and consumer per configured binding. The secondary queue's consumer is responsible for delivering messages to the handler at the configured rate. In the original consumer's logic, when throttling is enabled, messages that have a matching binding are published to the secondary queue instead of getting delivered to the handler directly.
 
-The regular consumer loops over each message received on the channel and checks if there’s an active alert and if the message binding is in the list of bindings to throttle. If both are true, the message gets published to the secondary throttle queue. Otherwise, the recipient’s handlerFunc is called to deliver the message to the service. 
+The regular consumer loops over each message received on the channel and checks if there’s an active alert and if the message binding is in the list of bindings to throttle. If both are true, the message gets published to the secondary throttled queue. Otherwise, the recipient’s handlerFunc is called to deliver the message to the service. 
 
 
 ``` go
 // HandlerFunc contains the recipient's processing logic to process incoming messages
 type HandlerFunc func(message msg) error
 
-func (b *broker) consume(deliveryChan <- chan msg, handler HandlerFunc) {
+func consume(deliveryChan <- chan msg, handler HandlerFunc) {
 	for d := range deliveryChan {
 		ctx := context.Background()
-		if b.alertActive && isThrottledBinding() {
+		// alertActive is set when an alert is processed
+		if alertActive && isThrottledBinding() {
 			// publish to secondary queue
 			b.Publish(ctx, topic, key, msg)
 			continue
@@ -94,7 +95,7 @@ func (b *broker) consume(deliveryChan <- chan msg, handler HandlerFunc) {
 The consumer of the throttled queue will then apply a delay before calling the recipient's handlerFunc. A simple way to do this is using the `Sleep()` function from Go’s time package:
 
 ``` go
-func (b *broker) consumeThrottled(deliveryChan <- chan msg, handler HandlerFunc) {
+func consumeThrottled(deliveryChan <- chan msg, handler HandlerFunc) {
 	for d := range deliveryChan {
 		// wait 30 seconds before delivering message to handler
 		time.Sleep(30)
@@ -128,7 +129,7 @@ type Throttler interface {
 	apply()
 }
 
-func (b *broker) consumeThrottled(deliveryChan <- chan msg, handler HandlerFunc, throttler Throttler) {
+func consumeThrottled(deliveryChan <- chan msg, handler HandlerFunc, throttler Throttler) {
 	for d := range deliveryChan {
 		// instead of a delay, use the throttler method
 		throttler.apply()
@@ -177,12 +178,16 @@ func (i *intervalThrottler) apply() {
 
 ### Backoff throttling
 
-This is the most complex policy so far because the delay used by the throttler needs to get updated over time. The time package in Go has a ticker, which delivers “ticks” over a channel at an interval. Since the delay has to be updated in parallel with the throttling, we can spin up another goroutine that uses a ticker to update the current delay. For better code organization and reusability, let’s extract this logic into its own method:
+This is the trickiest policy to implement so far since the throttler's delay changes over time. These updates should be done on an interval in parallel to the throttling itself. Luckily, the time package in Go has a ticker, which delivers “ticks” over a channel at an interval. Since the delay has to be updated in parallel with the throttling, we can spin up another goroutine that uses a ticker to update the current delay. For better code organization and reusability, let’s extract this logic into its own method. We can define a new struct that contains a `time.Duration` field, then create a method that updates the delay in a separate goroutine.
 
 
 ```go
+type adjustableDelay struct {
+	val time.Duration
+}
+
 type backoffThrottler struct {
-	currentDelay time.Duration
+	currentDelay adjustableDelay
 
 	// user input
 	initialDelay time.Duration
@@ -221,7 +226,7 @@ func (bo *backoffThrottler) apply() {
 
 On every iteration of the loop, we should check if the max delay has been reached so we can stop the ticker and exit the goroutine as soon as the job is done. It’s noteworthy to mention that the value of the multiplier provided must be greater than 1, otherwise we would end up consuming messages at a faster rate.
 
-In the next section, we will dive into the other side of our pressure relief valve and talk about how we transition between the two.
+In the next section, we will dive into the other side of our pressure relief valve and talk about how we transition between the two states.
 
 # Recovery
 They say what goes up must come down. In the context of the pressure relief valve we have built so far, this means that once the pressure dies down, the valve should slowly return to its original position. In other words, when the alert is cleared, we want to slowly increase the rate of processing until we return to the normal rate of processing. 
@@ -233,33 +238,34 @@ The exciting part is that we’ve already put together the functionality needed 
 Here’s what it looks like in code:
 
 ```go
-	if (multiplier > 1 && a.val.Seconds() >= maxDelay.Seconds()) || (multiplier < 1 && a.val.Seconds() <= 1) {
-		// stop ticker and exit goroutine
-		t.Stop()
-		return
-	}
+if (multiplier > 1 && a.val.Seconds() >= maxDelay.Seconds()) || (multiplier < 1 && a.val.Seconds() <= 1) {
+    // stop ticker and exit goroutine
+    t.Stop()
+    return
+}
 ```
 
-Now we have all the building blocks of our self-regulating pressure relief valve! The next logical step is automatically switching between throttling and recovery when alerts are received. In our barebone throttler, we have already configured the normal consumer to publish to the throttle queue if an alert is active, or call the recipient’s handlerFunc instead if no alert is active. Something similar needs to happen in the consumer of the throttled queue. We could do the same active alert check before calling the throttler’s `apply()` method, but we actually run into some problems with this approach. First, if we take a second look at the block throttler implementation, we’ll notice that there’s no exit condition for our `apply()` function. Ultimately, this means that we’re stuck throttling the message forever with no way to switch to recovery. Along similar lines, for the other throttling/recovery policies, there’s no mechanism to exit `apply()` early if the alert value has changed. For fairly small delay configurations, this may not be an issue. However, it’s important to ensure our solution is efficient for a wide range of delay values. 
+Now we have all the building blocks of our self-regulating pressure relief valve! The next logical step is to automate the switch between throttling and recovery states when alerts are received. 
 
-This is where we can leverage Go’s context package! For each message in the throttle consumer, let’s create a context with cancellation. We can pass this context to all methods that might need to exit early if the alert value is changed. To listen to changes in alert values, we can have a channel on the broker that receives values in a separate goroutine and cancels the current message’s context when a value is received. 
+In our barebone throttler, we have already configured the normal consumer to publish to the throttled queue if an alert is active, or call the recipient’s handlerFunc instead if no alert is active. Something similar needs to happen in the consumer of the throttled queue. We could do the same active alert check before calling the throttler’s `apply()` method, but we actually run into some problems with this approach. First, if we take a another look at the block throttler implementation, we’ll notice that there’s no exit condition for our `apply()` function. Ultimately, this means that we’re stuck throttling the message forever with no way to switch to recovery. Along similar lines, for the other throttling/recovery policies, there’s no mechanism to exit `apply()` early if the alert value has changed. For fairly small delay configurations, this may not be an issue. However, it’s important to ensure our solution is efficient for a wide range of delay values. 
+
+This is where we can leverage Go’s context package! For each message received on the message channel, let’s create a context with cancellation. We can pass this context to all methods that might need to exit early if the alert value is changed. To listen to changes in alert values, we can have a channel that receives values in a separate goroutine and cancels the current message’s context when a value is received. 
 
 Our throttle consumer now looks like this:
 
 ```go
-func (b *broker) consumeThrottled(deliveryChan <- chan msg, handler HandlerFunc, throttler Throttler) {
+func consumeThrottled(deliveryChan <- chan msg, alert <- chan bool, handler HandlerFunc, throttler Throttler) {
 	for d := range deliveryChan {
 		func() {
-
 			// create context with cancel
 			ctx, cancel := context.WithCancel(context.Background())
 
-			// we should always release resources associated with the context when done
+			// resources associated with the context should be released when done
 			defer cancel()
 
 			go func() {
-				// listen to changes in alert over channel on broker
-				<-b.alert.switchMode
+				// listen to changes in alert over channel
+				<-alert
 				// when value received, cancel the context
 				cancel()
 			}()
@@ -276,7 +282,7 @@ func (b *broker) consumeThrottled(deliveryChan <- chan msg, handler HandlerFunc,
 }
 ```
 
-You may have noticed something that looks unusual. Right inside the loop ranging over messages on the deliveryChan we have an anonymous function. According to the Go language spec, defer “invokes a function whose execution is deferred to the moment the surrounding function returns.” This could cause unintended behavior if it’s called inside of a loop. By wrapping all the logic inside an anonymous function, the defer now runs at the end of every iteration of the loop instead.
+You may have noticed something that looks unusual... right inside the loop ranging over messages on the deliveryChan there's an anonymous function. This was added to address a potential issue with using a defer statement inside a loop. According to the [Go language spec](https://go.dev/ref/spec#Defer_statements), defer “invokes a function whose execution is deferred to the moment the surrounding function returns.” For our consumer logic, this means that the context is **not** cancelled when we're done processing the current message. By wrapping all the logic inside an anonymous function, the defer now runs at the end of every iteration of the loop instead.
 
 Next, we have to adjust the `apply()` method for each throttler to exit early if the context provided is cancelled before the specified duration has passed. For the block throttler, instead of an empty select statement, we just block until the context is cancelled:
 
@@ -301,7 +307,7 @@ func (i *interval) apply(ctx context.Context) {
 }
 ```
 
-This select will block until the context has been cancelled or the entire duration of the delay has passed, whichever happens first. However, if we take a closer look at the documentation for `time.After()`, we find that “The underlying Timer is not recovered by the garbage collector until the timer fires. If efficiency is a concern, use NewTimer instead and call Timer.Stop if the timer is no longer needed.” 
+This select will block until the context has been cancelled or the entire duration of the delay has passed, whichever happens first. However, if we take a closer look at the [documentation](https://pkg.go.dev/time#After) for `time.After()`, we find that “The underlying Timer is not recovered by the garbage collector until the timer fires. If efficiency is a concern, use NewTimer instead and call Timer.Stop if the timer is no longer needed.” 
 
 Let’s make that adjustment:
 
