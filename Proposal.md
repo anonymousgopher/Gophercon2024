@@ -76,15 +76,14 @@ type HandlerFunc func(message msg) error
 
 func consume(deliveryChan <- chan msg, handler HandlerFunc) {
 	for d := range deliveryChan {
-		ctx := context.Background()
 		// alertActive is set when an alert is processed
 		if alertActive && isThrottledBinding() {
 			// publish to secondary queue
-			b.Publish(ctx, topic, key, msg)
+			b.Publish(topic, key, msg)
 			continue
 		}
 		// recipient's handlerFunc
-		err := handler(ctx, msg)
+		err := handler(msg)
 		if err != nil {
 			log.Printf("Handler returned error: %s", err)
 		}
@@ -135,7 +134,7 @@ func consumeThrottled(deliveryChan <- chan msg, handler HandlerFunc, throttler T
 		throttler.apply()
 
 		// recipient's handlerFunc
-		err := handler(ctx, msg)
+		err := handler(msg)
 		if err != nil {
 			log.Printf("Handler returned error: %s", err)
 		}
@@ -217,10 +216,10 @@ func (a *adjustableDelay) adjust(interval time.Duration, multiplier float64, max
 func (bo *backoffThrottler) apply() {
 	// on first call, initialize throttler values
 	if bo.currentDelay == 0 {
-		bo.currentDelay = bo.initialDelay
+		bo.currentDelay.val = bo.initialDelay
 		bo.currentDelay.adjust(bo.backoffInterval, bo.multiplier, bo.maxDelay)
 	}
-	time.Sleep(bo.currentDelay)
+	time.Sleep(bo.currentDelay.val)
 }
 ```
 
@@ -238,10 +237,22 @@ The exciting part is that we’ve already put together the functionality needed 
 Here’s what it looks like in code:
 
 ```go
-if (multiplier > 1 && a.val.Seconds() >= maxDelay.Seconds()) || (multiplier < 1 && a.val.Seconds() <= 1) {
-    // stop ticker and exit goroutine
-    t.Stop()
-    return
+func (a *adjustableDelay) adjust(interval time.Duration, multiplier float64, maxDelay time.Duration) {
+	go func() {
+		t := time.NewTicker(interval)
+		for {
+			// block until tick received
+			select {
+			case <-t.C:
+				a.val = time.Duration(a.val.Seconds()*multiplier) * time.Second
+				if (multiplier > 1 && a.val.Seconds() >= maxDelay.Seconds()) || (multiplier < 1 && a.val.Seconds() <= 1) {
+					// stop ticker and exit goroutine
+					t.Stop()
+					return
+				}
+			}
+		}
+	}()
 }
 ```
 
